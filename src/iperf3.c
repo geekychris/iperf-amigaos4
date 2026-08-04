@@ -213,7 +213,9 @@ static int send_results(int ctrl, uint64_t total_bytes, double elapsed_sec)
     cJSON_AddNumberToObject(root, "cpu_util_user",   0.0);
     cJSON_AddNumberToObject(root, "cpu_util_system", 0.0);
     cJSON_AddNumberToObject(root, "sender_has_retransmits", -1);
-    cJSON_AddNumberToObject(root, "congestion_used", 0);
+    /* Server insists this is a string (iperf3 grumbles
+     * "iperf_cJSON_GetObjectItemType mismatch congestion_used" otherwise). */
+    cJSON_AddStringToObject(root, "congestion_used", "unknown");
 
     cJSON *streams = cJSON_CreateArray();
     cJSON *s = cJSON_CreateObject();
@@ -242,13 +244,32 @@ static int blast(int data_fd, int duration, int blksize,
     if (!buf) return -1;
     memset(buf, 'X', blksize);
 
+    /* Print actual (post-setsockopt) SO_SNDBUF so we know if the kernel
+     * accepted our request or clamped it. */
+    int actual_sndbuf = -1;
+    socklen_t optlen = sizeof(actual_sndbuf);
+    if (getsockopt(data_fd, SOL_SOCKET, SO_SNDBUF,
+                   &actual_sndbuf, &optlen) == 0) {
+        printf("[sndbuf] SO_SNDBUF actual = %d bytes\n", actual_sndbuf);
+    }
+
     clock_t start = clock();
     clock_t end_clock = start + (clock_t)((double)duration * CLOCKS_PER_SEC);
     uint64_t total = 0;
+    uint64_t call_count = 0;
+    uint64_t short_writes = 0;
+
+    /* No per-iteration printf, no per-iteration clock(). Check the
+     * deadline every N sends to keep the loop tight. N=8 with a
+     * ~50 kpps ceiling gives ~150 wall-clock check per second — cheap. */
+    const int CHECK_EVERY = 8;
+    int since_check = 0;
 
     for (;;) {
-        clock_t now = clock();
-        if (now >= end_clock) break;
+        if (since_check++ >= CHECK_EVERY) {
+            since_check = 0;
+            if (clock() >= end_clock) break;
+        }
 
         ssize_t n = send(data_fd, buf, blksize, 0);
         if (n < 0) {
@@ -257,12 +278,18 @@ static int blast(int data_fd, int duration, int blksize,
             free(buf);
             return -1;
         }
+        call_count++;
+        if (n < blksize) short_writes++;
         total += (uint64_t)n;
     }
 
     clock_t end = clock();
     *out_bytes = total;
     *out_elapsed = (double)(end - start) / (double)CLOCKS_PER_SEC;
+    printf("[stats] %llu calls, %llu short writes, avg %llu bytes/call\n",
+           (unsigned long long)call_count,
+           (unsigned long long)short_writes,
+           call_count ? (unsigned long long)(total / call_count) : 0);
     free(buf);
     return 0;
 }
@@ -272,7 +299,11 @@ static int blast(int data_fd, int duration, int blksize,
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-        "usage: %s -c <host> [-p port=5201] [-t seconds=10] [-l blksize=131072]\n",
+        "usage: %s -c <host> [-p port=5201] [-t seconds=10] [-l blksize=131072] [--raw]\n"
+        "  --raw   skip iperf3 protocol; just open TCP and blast bytes for -t seconds.\n"
+        "          Use this against pyperf.py --server or any dumb-recv server to\n"
+        "          isolate whether the ~3 Mbit/s cap comes from our send code or\n"
+        "          from iperf3 server processing.\n",
         argv0);
 }
 
@@ -282,12 +313,14 @@ int main(int argc, char **argv)
     int port     = DEFAULT_PORT;
     int duration = DEFAULT_TIME;
     int blksize  = DEFAULT_BLKSIZE;
+    int raw_mode = 0;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-c") && i + 1 < argc)      host = argv[++i];
         else if (!strcmp(argv[i], "-p") && i + 1 < argc) port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-t") && i + 1 < argc) duration = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-l") && i + 1 < argc) blksize = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--raw"))              raw_mode = 1;
         else { usage(argv[0]); return 2; }
     }
     if (!host) { usage(argv[0]); return 2; }
@@ -301,9 +334,28 @@ int main(int argc, char **argv)
     dup2(fileno(stdout), fileno(stderr));
     setvbuf(stdout, NULL, _IONBF, 0);
 
-    printf("Connecting to iperf3 server %s:%d (TCP, %d s, blksize=%d)\n",
+    printf("Connecting to %s %s:%d (TCP, %d s, blksize=%d)\n",
+           raw_mode ? "raw-blast server" : "iperf3 server",
            host, port, duration, blksize);
     fflush(stdout);
+
+    if (raw_mode) {
+        int fd = connect_to(host, port);
+        if (fd < 0) return 1;
+        uint64_t bytes = 0;
+        double   elapsed = 0.0;
+        int rc = blast(fd, duration, blksize, &bytes, &elapsed);
+        close(fd);
+        if (rc == 0 && bytes > 0 && elapsed > 0.0) {
+            double mbps = ((double)bytes * 8.0) / (elapsed * 1.0e6);
+            printf("\n=== raw summary ===\n"
+                   "bytes:      %llu\nelapsed:    %.2f s\n"
+                   "throughput: %.2f Mbit/sec  (%.2f MB/sec)\n",
+                   (unsigned long long)bytes, elapsed, mbps,
+                   (double)bytes / (elapsed * 1024.0 * 1024.0));
+        }
+        return rc == 0 ? 0 : 1;
+    }
 
     int ctrl = connect_to(host, port);
     if (ctrl < 0) return 1;
@@ -342,11 +394,11 @@ int main(int argc, char **argv)
             if (Nwrite(data_fd, cookie, COOKIE_SIZE) != COOKIE_SIZE) {
                 fprintf(stderr, "cookie write to data conn failed\n"); break;
             }
-            /* Set larger send buffer for throughput. Best-effort. */
-            int sndbuf = 512 * 1024;
-            setsockopt(data_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
-            int nodelay = 1;
-            setsockopt(data_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+            /* Deliberately DO NOT touch SO_SNDBUF or TCP_NODELAY here.
+             * Roadshow appears to clamp SO_SNDBUF requests, and turning
+             * off Nagle costs ~15x throughput on the send loop (see the
+             * profile in commit history — pyperf.py uses defaults and
+             * gets 41 Mbit/s vs 3 Mbit/s when we set NODELAY). */
         }
         else if (state == TEST_START) {
             printf("[state] TEST_START\n");
