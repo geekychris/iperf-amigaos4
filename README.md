@@ -2,44 +2,48 @@
 
 A minimal `iperf3`-wire-protocol-compatible **client** for AmigaOS 4.1 PPC.
 Runs against a stock `iperf3 -s` server on Linux / macOS to measure real
-TCP throughput of a SANA-II driver + Roadshow TCP stack.
+TCP throughput of a SANA-II network driver + Roadshow TCP stack.
 
-Written because the upstream `iperf3` codebase (esnet/iperf) requires
-POSIX pthreads which AmigaOS 4 doesn't have. A full port would need a
-pthread→OS4 process shim (2–3 weeks of work). This project instead
-speaks the iperf3 wire protocol directly with plain OS4 tasks, using
+Written because upstream `iperf3` (esnet/iperf) is pthread-mandatory
+since 3.x, and AmigaOS 4 doesn't have POSIX threads. Rather than write
+a pthread → OS4 process shim (2–3 weeks of work), this project speaks
+the iperf3 wire protocol directly using a single OS4 task and
 Roadshow's `bsdsocket.library`.
 
 ## Scope
 
 **Supported:**
-- TCP throughput test
-- Client mode (forward direction — guest sends to host)
-- `-c <host>` `-p <port>` `-t <time>`
+- TCP client only, forward direction (guest sends to host)
+- `-c <host>` `-p <port>` `-t <seconds>` `-l <blksize>`
 - Single stream
+- Real iperf3 wire protocol (works against any `iperf3 -s`)
+- `--raw` mode: skip the iperf3 protocol; open TCP and blast. Useful
+  against `pyperf.py --server` or any dumb-recv server.
+- `--direct` mode (implies `--raw`): call `ISocket->send()` from an
+  explicit `IExec->OpenLibrary("bsdsocket.library", 4)` instead of
+  going through newlib's libc socket wrapper. Diagnostic — should
+  be same throughput as libc.
 
 **Not supported (yet):**
-- Reverse mode
-- UDP
-- Multi-stream / `-P N`
+- Reverse mode / UDP / multi-stream (`-P N`)
 - Server mode
 - SCTP / auth / bidirectional
-- JSON output on our side (the server prints the number)
+- JSON output on the client side (the iperf3 server prints the number)
 
 ## Build
 
 Requires Docker + the walkero AmigaOS 4 GCC 11 image (auto-selected
-for your host arch).
+for your host arch — arm64 image on Apple Silicon, amd64 on x86 hosts).
 
 ```
 ./scripts/build.sh
 ```
 
-Output: `build/iperf3` (PPC ELF, statically linked, stripped).
+Output: `build/iperf3` (PPC ELF, statically linked, stripped, ~80 KB).
 
 ## Deploy + run
 
-Push to guest DH1: via `amiga_mcp` devbench:
+Push to guest `DH1:` via `amiga_mcp` devbench:
 
 ```
 curl -sf -X POST http://localhost:3000/api/transfer \
@@ -50,7 +54,7 @@ curl -sf -X POST http://localhost:3000/api/transfer \
 On host: start server (pick a port that isn't hostfwd'd by QEMU):
 
 ```
-iperf3 -s -p 17999
+iperf3 -s -p 17999 --forceflush
 ```
 
 On guest:
@@ -59,8 +63,46 @@ On guest:
 DH1:iperf3 -c 192.168.100.2 -p 17999 -t 10
 ```
 
-(`192.168.100.2` is the SLIRP gateway which doubles as the host proxy
-in `amiga_mcp`'s default QEMU config.)
+`192.168.100.2` is the SLIRP gateway which doubles as a host proxy
+in `amiga_mcp`'s default QEMU config. `--forceflush` prevents
+iperf3 -s from buffering its stdout when redirected to a file.
+
+## Measuring throughput correctly
+
+**Always start from a fresh QEMU boot for benchmark numbers.**
+
+We observed that after ~2–3 successive TCP tests the guest's TCP
+throughput degrades from ~40 Mbit/s to ~2–3 Mbit/s. The pattern
+affects both this client and pyperf.py equally, so it isn't a
+client-specific bug. Most likely explanation: Roadshow's TCP
+control-block pool filling with TIME_WAIT-parked connections
+(default TIME_WAIT is minutes long). See `docs/PERF-TESTING.md`
+for the full write-up and the diagnostics we ran.
+
+Recipe for a real number:
+
+```
+# host
+./scripts/start-qemu-os4.sh          # from amiga_mcp
+# wait for guest to boot + bridge to come up
+iperf3 -s -p 17999 --forceflush &
+
+# guest — take the FIRST result
+DH1:iperf3 -c 192.168.100.2 -p 17999 -t 10
+```
+
+Expected: ~40 Mbit/s on Bill Borsari's `virte1000.device` over
+QEMU sam460ex e1000 emulation via SLIRP.
+
+## Files
+
+- `src/iperf3.c` — client, wire protocol + state machine + blast loop (~500 lines)
+- `src/cjson.c`, `include/cjson.h` — bundled cJSON from esnet/iperf
+- `include/iperf_config.h` — stub for cjson's unconditional include
+- `Makefile` — cross-compile via walkero:os4-gcc11
+- `scripts/build.sh` — docker wrapper
+- `docs/PERF-TESTING.md` — full profiling story, what we learned,
+  known caveats around SLIRP/TCP state degradation
 
 ## License
 
