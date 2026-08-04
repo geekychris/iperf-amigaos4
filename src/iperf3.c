@@ -41,6 +41,11 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 
+#ifdef __amigaos4__
+#include <proto/exec.h>
+#include <proto/bsdsocket.h>
+#endif
+
 #include "cjson.h"
 
 /* Wire protocol constants — must match iperf3 exactly. */
@@ -299,13 +304,99 @@ static int blast(int data_fd, int duration, int blksize,
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-        "usage: %s -c <host> [-p port=5201] [-t seconds=10] [-l blksize=131072] [--raw]\n"
-        "  --raw   skip iperf3 protocol; just open TCP and blast bytes for -t seconds.\n"
-        "          Use this against pyperf.py --server or any dumb-recv server to\n"
-        "          isolate whether the ~3 Mbit/s cap comes from our send code or\n"
-        "          from iperf3 server processing.\n",
+        "usage: %s -c <host> [-p port=5201] [-t seconds=10] [-l blksize=131072] [--raw] [--direct]\n"
+        "  --raw     skip iperf3 protocol; just open TCP and blast bytes for -t seconds.\n"
+        "  --direct  use ISocket->send() directly (bypass newlib libc socket wrapper).\n"
+        "            Only meaningful with --raw. Probes whether newlib's send()\n"
+        "            wrapper is the ~3 Mbit/s ceiling (vs library-level).\n",
         argv0);
 }
+
+#ifdef __amigaos4__
+/* Direct-blast: open bsdsocket + call ISocket-> methods directly, skipping
+ * newlib's socket wrapper. Same syscall (in principle) but no libc layer. */
+static int blast_direct(const char *host, int port, int duration, int blksize,
+                        uint64_t *out_bytes, double *out_elapsed)
+{
+    struct Library *SB = NULL;
+    struct SocketIFace *IS = NULL;
+    LONG s = -1;
+    char *buf = NULL;
+    int rc = -1;
+
+    SB = IExec->OpenLibrary("bsdsocket.library", 4);
+    if (!SB) { fprintf(stderr, "OpenLibrary bsdsocket.library failed\n"); return -1; }
+    IS = (struct SocketIFace *)IExec->GetInterface(SB, "main", 1, NULL);
+    if (!IS) { fprintf(stderr, "GetInterface main failed\n"); goto out; }
+
+    /* Point Roadshow at our errno so we can read errors. Same protocol
+     * as newlib's auto-init does — worth trying with different sizes if
+     * this doesn't fix the perf gap. */
+    IS->SetErrnoPtr(&errno, sizeof(errno));
+
+    s = IS->socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) { fprintf(stderr, "ISocket->socket failed: %d\n", (int)IS->Errno()); goto out; }
+
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port   = htons((uint16_t)port);
+    if (inet_pton(AF_INET, host, &sa.sin_addr) != 1) {
+        fprintf(stderr, "--direct requires a numeric IPv4 host (got %s)\n", host);
+        goto out;
+    }
+    if (IS->connect(s, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        fprintf(stderr, "ISocket->connect failed: %d\n", (int)IS->Errno());
+        goto out;
+    }
+    printf("[direct] connected via ISocket\n");
+
+    /* Query actual send buffer size — same as -lauto path would see. */
+    LONG actual = -1;
+    socklen_t optlen = sizeof(actual);
+    if (IS->getsockopt(s, SOL_SOCKET, SO_SNDBUF, &actual, &optlen) == 0)
+        printf("[direct] SO_SNDBUF = %ld\n", (long)actual);
+
+    buf = (char *)malloc(blksize);
+    if (!buf) { fprintf(stderr, "malloc failed\n"); goto out; }
+    memset(buf, 'X', blksize);
+
+    clock_t start = clock();
+    clock_t end_clock = start + (clock_t)((double)duration * CLOCKS_PER_SEC);
+    uint64_t total = 0, calls = 0, shorts = 0;
+    const int CHECK_EVERY = 8;
+    int since_check = 0;
+
+    for (;;) {
+        if (since_check++ >= CHECK_EVERY) {
+            since_check = 0;
+            if (clock() >= end_clock) break;
+        }
+        LONG n = IS->send(s, buf, blksize, 0);
+        if (n < 0) {
+            fprintf(stderr, "ISocket->send failed: %d\n", (int)IS->Errno());
+            goto out;
+        }
+        calls++;
+        if (n < blksize) shorts++;
+        total += (uint64_t)n;
+    }
+
+    clock_t end = clock();
+    *out_bytes   = total;
+    *out_elapsed = (double)(end - start) / (double)CLOCKS_PER_SEC;
+    printf("[direct stats] %llu calls, %llu short, avg %llu bytes/call\n",
+           (unsigned long long)calls, (unsigned long long)shorts,
+           calls ? (unsigned long long)(total / calls) : 0);
+    rc = 0;
+out:
+    if (buf) free(buf);
+    if (s >= 0 && IS) IS->CloseSocket(s);
+    if (IS) IExec->DropInterface((struct Interface *)IS);
+    if (SB) IExec->CloseLibrary(SB);
+    return rc;
+}
+#endif
 
 int main(int argc, char **argv)
 {
@@ -314,6 +405,7 @@ int main(int argc, char **argv)
     int duration = DEFAULT_TIME;
     int blksize  = DEFAULT_BLKSIZE;
     int raw_mode = 0;
+    int direct_mode = 0;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-c") && i + 1 < argc)      host = argv[++i];
@@ -321,7 +413,12 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "-t") && i + 1 < argc) duration = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-l") && i + 1 < argc) blksize = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--raw"))              raw_mode = 1;
+        else if (!strcmp(argv[i], "--direct"))           direct_mode = 1;
         else { usage(argv[0]); return 2; }
+    }
+    if (direct_mode && !raw_mode) {
+        fprintf(stderr, "--direct implies --raw (protocol path uses libc); enabling --raw\n");
+        raw_mode = 1;
     }
     if (!host) { usage(argv[0]); return 2; }
     if (duration <= 0) duration = DEFAULT_TIME;
@@ -340,17 +437,26 @@ int main(int argc, char **argv)
     fflush(stdout);
 
     if (raw_mode) {
-        int fd = connect_to(host, port);
-        if (fd < 0) return 1;
         uint64_t bytes = 0;
         double   elapsed = 0.0;
-        int rc = blast(fd, duration, blksize, &bytes, &elapsed);
-        close(fd);
+        int rc;
+#ifdef __amigaos4__
+        if (direct_mode) {
+            rc = blast_direct(host, port, duration, blksize, &bytes, &elapsed);
+        } else
+#endif
+        {
+            int fd = connect_to(host, port);
+            if (fd < 0) return 1;
+            rc = blast(fd, duration, blksize, &bytes, &elapsed);
+            close(fd);
+        }
         if (rc == 0 && bytes > 0 && elapsed > 0.0) {
             double mbps = ((double)bytes * 8.0) / (elapsed * 1.0e6);
-            printf("\n=== raw summary ===\n"
+            printf("\n=== %s summary ===\n"
                    "bytes:      %llu\nelapsed:    %.2f s\n"
                    "throughput: %.2f Mbit/sec  (%.2f MB/sec)\n",
+                   direct_mode ? "direct" : "raw",
                    (unsigned long long)bytes, elapsed, mbps,
                    (double)bytes / (elapsed * 1024.0 * 1024.0));
         }
