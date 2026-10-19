@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="Iperf Amigaos4 logo" width="180">
+</p>
+
 # iperf-amigaos4
 
 A minimal `iperf3`-wire-protocol-compatible **client** for AmigaOS 4.1 PPC.
